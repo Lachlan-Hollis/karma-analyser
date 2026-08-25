@@ -1,22 +1,95 @@
 import asyncio
-import base64
 import inspect
 import json
 import logging
 import os
-from collections import OrderedDict
-from datetime import datetime
-from json import JSONDecodeError
+from contextlib import asynccontextmanager
+from datetime import datetime, timedelta
+from inspect import cleandoc
 from zoneinfo import ZoneInfo
 
 import aiohttp
 import discord
 import regex
-from bs4 import BeautifulSoup
 from ollama import Client
 
 import utils
-from utils import REDDIQUETTE, karmic_dict
+from utils import ai_memories, ai_memory_lock, karma_lock, karmic_dict
+
+
+REDDIQUETTE = """
+    Dos:
+    ⦁ Remember the human. When you communicate online, all you see is a computer screen. When talking to someone you might want to ask yourself Would I say it to the person's face? or Would I get jumped if I said this to a buddy?
+    ⦁ Adhere to the same standards of behavior online that you follow in real life.
+    ⦁ Read the rules of a community before making a submission. These are usually found in the sidebar.
+    ⦁ Read the reddiquette. Read it again every once in a while. Reddiquette is a living, breathing, working document which may change over time as the community faces new problems in its growth.
+    ⦁ Moderate based on quality, not opinion. Well written and interesting content can be worthwhile, even if you disagree with it.
+    ⦁ Use proper grammar and spelling. Intelligent discourse requires a standard system of communication. Be open for gentle corrections.
+    ⦁ Keep your submission titles factual and opinion free. If it is an outrageous topic, share your crazy outrage in the comment section.
+    ⦁ Look for the original source of content, and submit that. Often, a blog will reference another blog, which references another, and so on with everyone displaying ads along the way. Dig through those references and submit a link to the creator, who actually deserves the traffic.
+    ⦁ Post to the most appropriate community possible. Also, consider cross posting if the contents fits more communities.
+    ⦁ Vote. If you think something contributes to conversation, upvote it. If you think it does not contribute to the subreddit it is posted in or is off-topic in a particular community, downvote it.
+    ⦁ Search for duplicates before posting. Redundancy posts add nothing new to previous conversations. That said, sometimes bad timing, a bad title, or just plain bad luck can cause an interesting story to fail to get noticed. Feel free to post something again if you feel that the earlier posting didn't get the attention it deserved and you think you can do better.
+    ⦁ Link to the direct version of a media file if the page it was found on isn't the creator's and doesn't add additional information or context.
+    ⦁ Link to canonical and persistent URLs where possible, not temporary pages that might disappear.In particular, use the permalink for blog entries, not the blog's index page.
+    ⦁ Consider posting constructive criticism / an explanation when you downvote something, and do so carefully and tactfully.
+    ⦁ Report any spam you find.
+    ⦁ Actually read an article before you vote on it ( as opposed to just basing your vote on the title).
+    ⦁ Feel free to post links to your own content (within reason).But if that's all you ever post, or it always seems to get voted down, take a good hard look in the mirror — you just might be a spammer. A widely used rule of thumb is the 9:1 ratio, i.e. only 1 out of every 10 of your submissions should be your own content.
+    ⦁ Posts containing explicit material such as nudity, horrible injury etc, add NSFW (Not Safe For Work) and tag. However, if something IS safe for work, but has a risqué title, tag as SFW (Safe for Work). Additionally, use your best judgement when adding these tags, in order for everything to go swimmingly.
+    ⦁ State your reason for any editing of posts. Edited submissions are marked by an asterisk (*) at the end of the timestamp after three minutes. For example: a simple Edit: spelling will help explain. This avoids confusion when a post is edited after a conversation breaks off from it. If you have another thing to add to your original comment, say Edit: And I also think... or something along those lines.
+    ⦁ Use an Innocent until proven guilty mentality. Unless there is obvious proof that a submission is fake, or is whoring karma, please don't say it is. It ruins the experience for not only you, but the millions of people that browse Reddit every day.
+    ⦁ Read over your submission for mistakes before submitting, especially the title of the submission. Comments and the content of self posts can be edited after being submitted, however, the title of a post can't be. Make sure the facts you provide are accurate to avoid any confusion down the line.
+    Don'ts:
+    ⦁ Engage in illegal activity.
+    ⦁ Post someone's personal information, or post links to personal information. This includes links to public Facebook pages and screenshots of Facebook pages with the names still legible. We all get outraged by the ignorant things people say and do online, but witch hunts and vigilantism hurt innocent people too often, and such posts or comments will be removed. Users posting personal info are subject to an immediate account deletion. If you see a user posting personal info, please contact the admins. Additionally, on pages such as Facebook, where personal information is often displayed, please mask the personal information and personal photographs using a blur function, erase function, or simply block it out with color. When personal information is relevant to the post (i.e. comment wars) please use color blocking for the personal information to indicate whose comment is whose.
+    ⦁ Repost deleted/removed information. Remember that comment someone just deleted because it had personal information in it or was a picture of gore? Resist the urge to repost it. It doesn't matter what the content was. If it was deleted/removed, it should stay deleted/removed.
+    ⦁ Be (intentionally) rude at all. By choosing not to be rude, you increase the overall civility of the community and make it better for all of us.
+    ⦁ Follow those who are rabble rousing against another redditor without first investigating both sides of the issue that's being presented. Those who are inciting this type of action often have malicious reasons behind their actions and are, more often than not, a troll. Remember, every time a redditor who's contributed large amounts of effort into assisting the growth of community as a whole is driven away, projects that would benefit the whole easily flounder.
+    ⦁ Ask people to Troll others on Reddit, in real life, or on other blogs/sites. We aren't your personal army.
+    ⦁ Conduct personal attacks on other commenters. Ad hominem and other distracting attacks do not add anything to the conversation.
+    ⦁ Start a flame war. Just report and walk away. If you really feel you have to confront them, leave a polite message with a quote or link to the rules, and no more.
+    ⦁ Insult others. Insults do not contribute to a rational discussion. Constructive Criticism, however, is appropriate and encouraged.
+    ⦁ Troll. Trolling does not contribute to the conversation.
+    ⦁ Take moderation positions in a community where your profession, employment, or biases could pose a direct conflict of interest to the neutral and user driven nature of Reddit.
+"""
+
+JSON_PATTERN = regex.compile(
+    r"""
+        (
+            \{ (?: [^{}]++ | (?R) )* \}
+          | \[ (?: [^\[\]]++ | (?R) )* \]
+        )
+    """,
+    regex.VERBOSE,
+)
+
+BASE_INSTRUCTIONS = """
+    You have access to tools. You may call multiple tools before responding.
+
+    Tool usage rules:
+    - You may call multiple tools in sequence
+    - You may call multiple different tools in parallel
+    - Do NOT call the same tool repeatedly unless new information is required
+    - If a tool already returned sufficient information, do not call it again
+    - Prefer using different tools to gather complementary information
+    - Plan before calling tools
+
+    Reasoning workflow:
+    1. Think about what information is needed
+    2. Decide which tools to call
+    3. Call tools (possibly multiple)
+    4. Combine results
+    5. If a tool call can be used to create something relevant to the user, do so
+    6. If there is a memory related to the user that could be relevant later, store it using the tool call
+    7. Only then respond to the user
+
+    Only respond to the user when you are completely finished using tools.
+
+    Do not call tools unnecessarily.
+    Do not repeat the same tool call with identical arguments.
+    Do not use table formatting in your answers.
+"""
 
 
 ## Tool decorator
@@ -26,16 +99,12 @@ def tool(func):
 
 
 class AITools:
-
     def __init__(self, bot):
         self.bot = bot
         self.logger = logging.getLogger(self.__class__.__name__)
 
-        self.model = "artifish/llama3.2-uncensored"
+        self.model = "gpt-oss:120b-cloud"
         self.vision_model = "llava"
-
-        self.message_cache = OrderedDict()
-        self.cache_size = 1000
 
         self.ollama_endpoint = os.getenv("OLLAMA_ENDPOINT")
         self.searxng_endpoint = os.getenv("SEARXNG_ENDPOINT")
@@ -50,12 +119,54 @@ class AITools:
         self.search_url = f"http://{self.searxng_endpoint}/search"
 
         self.tools = [
-            function for _, function in inspect.getmembers(self, predicate=inspect.ismethod)
+            function
+            for _, function in inspect.getmembers(self, predicate=inspect.ismethod)
             if getattr(function, "is_tool", False)
         ]
 
+        self.tool_definitions = [self._generate_tool_definition(f) for f in self.tools]
+
+    def _generate_tool_definition(self, func):
+        """
+        Generates a tool definition for the Ollama API from a Python function.
+        :param func: Python function
+        :return: Ollama API tool definition
+        """
+        sig = inspect.signature(func)
+        docstring = inspect.getdoc(func) or ""
+
+        parameters = {"type": "object", "properties": {}, "required": []}
+
+        for name, param in sig.parameters.items():
+            if name in ["self", "server", "user"]:
+                continue
+
+            param_type = "string"
+            if param.annotation is int:
+                param_type = "integer"
+            elif param.annotation is bool:
+                param_type = "boolean"
+            elif param.annotation is float:
+                param_type = "number"
+
+            parameters["properties"][name] = {
+                "type": param_type,
+            }
+
+            if param.default is inspect.Parameter.empty:
+                parameters["required"].append(name)
+
+        return {
+            "type": "function",
+            "function": {
+                "name": func.__name__,
+                "description": docstring,
+                "parameters": parameters,
+            },
+        }
+
     async def ollama_response(
-            self, system_instructions, messages, server, user, model: str | None = None
+        self, message, system_instructions, messages, model: str | None = None
     ) -> str | None:
         """
         Generates an AI response using the ollama API.
@@ -66,356 +177,172 @@ class AITools:
         :param model: Optional - model to use for text generation
         :return: AI response string
         """
-        use_tools = False
         if model is None:
             model = self.model
-            use_tools = True
 
-        original_messages = messages = [system_instructions] + list(messages)
+        system_instructions = {
+            "role": "system",
+            "content": cleandoc(BASE_INSTRUCTIONS) + system_instructions,
+        }
 
         while True:
-            response = await asyncio.to_thread(
-                self.client.chat,
-                model=model,
-                messages=messages,
-                tools=self.tools if use_tools else ""
-            )
-            self.logger.debug(f"RESPONSE: {response.message.content}")
+            # Send the user's message to Ollama
+            try:
+                response = await asyncio.to_thread(
+                    self.client.chat,
+                    model=model,
+                    messages=[system_instructions] + list(messages),
+                    tools=self.tool_definitions,
+                )
+            except Exception:
+                self.logger.exception(f"Error calling Ollama API for model {model}")
+                return "RESPONSE GENERATION FAILED, PLEASE DOWNVOTE"
 
             tool_calls = response.message.tool_calls or []
 
-            json_pattern = regex.compile(
-                r"""
-                    (
-                        \{ (?: [^{}]++ | (?R) )* \}
-                      | \[ (?: [^\[\]]++ | (?R) )* \]
-                    )
-                """, regex.VERBOSE
+            # Go straight to the final response if no tool calls
+            if not tool_calls:
+                return response.message.content
+
+            # Append the tool call message for context
+            messages.append(response.message)
+
+            # Handle tools
+            tool_messages = await self._handle_tools(tool_calls, message)
+            messages.extend(tool_messages)
+            self.logger.debug(
+                f"Sending {len(messages)} messages to Ollama | "
+                f"Last Message: {messages[-1] if messages else None}"
             )
 
-            for j in json_pattern.findall(response.message.content):
-                try:
-                    data = json.loads(j)
-                    if isinstance(data, dict) and data.get("type") == "function":
-                        tool_calls.append(data)
-                except JSONDecodeError as e:
-                    self.logger.error(e)
-                    continue
+            # Loop again until AI no longer needs to call tools
 
-            if tool_calls:
-                # self.logger.debug(f"TOOL CALLS: {tool_calls}")
-
-                for call in tool_calls:
-                    if isinstance(call, dict):
-                        function = call["function"]["name"]
-                        args = call.get("parameters") or {}
-                    else:
-                        function = call.function.name
-                        args = call.function.arguments or {}
-                        if isinstance(args, dict) and "parameters" in args:
-                            args = args["parameters"]
-
-                    function = next((f for f in self.tools if f.__name__ == function), None)
-                    if function:
-                        sig = inspect.signature(function)
-                        kwargs = {}
-
-                        for param in sig.parameters.values():
-                            if param.name == "server":
-                                kwargs[param.name] = server
-                            elif param.name == "user":
-                                kwargs[param.name] = args.get("user") or user
-                            elif param.name in args:
-                                kwargs[param.name] = args[param.name]
-                            elif param.default is not inspect.Parameter.empty:
-                                kwargs[param.name] = param.default
-
-                        self.logger.debug(f"Tool {function.__name__} called with {kwargs}")
-
-                        if inspect.iscoroutinefunction(function):
-                            result = await function(**kwargs)
-                        else:
-                            result = function(**kwargs)
-
-                        self.logger.debug(f"TOOL RESULT: {result}")
-
-                        messages.append(
-                            {
-                                "role"   : "tool",
-                                "name"   : function,
-                                "content": str(result)
-                            }
-                        )
-
-                    else:
-                        messages.append(
-                            {
-                                "role"   : "tool",
-                                "name"   : function,
-                                "content": "Tool doesn't exist"
-                            }
-                        )
-
-                continue
-
-            # Response Post-Processing
-            reply = json_pattern.sub("", response.message.content).strip()
-
-            # Fall back to response generation without tools if response is empty
-            if reply == "":
-                response = await asyncio.to_thread(
-                    self.client.chat,
-                    model=self.model,
-                    messages=original_messages
-                )
-                self.logger.warning("FALLING BACK TO NON-TOOL RESPONSE")
-                reply = response.message.content
-
-            guild = self.bot.get_guild(server)
-            if guild:
-                for member in guild.members:
-                    reply = regex.sub(
-                        rf"\b{regex.escape(member.name)}\b",
-                        member.mention,
-                        reply,
-                        flags=regex.IGNORECASE
-                    )
-
-            reply = regex.sub(
-                r"(<think>.*?</think>|<json>.*?</json>)\n\n",
-                "",
-                reply,
-                flags=regex.DOTALL
-            )
-
-            reply = regex.sub(
-                r'\{"type"\s*:\s*"function"\s*,\s*"function"\s*:\s*',
-                '',
-                reply
-            )
-
-            self.logger.debug(f"FINAL REPLY: {reply}")
-            return reply if reply.strip() else "RESPONSE GENERATION FAILED, PLEASE DOWNVOTE"
-
-    async def populate_messages(self, payload):
+    async def _handle_tools(self, tool_calls, message):
         """
-        Creates a message history from a single message,
-        looking through all of it's replies
-        :param payload: Message to start search from
-        :return: Message history
+        Executes Ollama tools and returns the resulting messages.
+        :param tool_calls:
+        :param server:
+        :param user:
+        :return: Tool result messages
         """
-        messages = []
-        current = await payload.channel.fetch_message(payload.reference.message_id)
 
-        while current:
-            image_urls = await self.extract_image_urls(current)
-            images_b64 = set()
-            if image_urls:
-                for url in image_urls:
-                    images_b64.add(await self.url_to_base64(url))
+        async def _run_tool(call):
+            function_name = call.function.name
+            args = call.function.arguments or {}
 
-            messages.append(
-                {
-                    "role"   : "assistant" if current.author.bot else "user",
-                    "content": regex.sub(
-                        r"<@!?(\d+)>",
-                        lambda m: (current.guild.get_member(int(m.author.id))).name
-                        if payload.guild.get_member(int(m.author.id)) else m.group(0),
-                        current.content
-                    ),
-                    "images" : images_b64 if images_b64 else "",
+            function = next(
+                (f for f in self.tools if f.__name__ == function_name), None
+            )
+
+            if not function:
+                return {
+                    "role": "tool",
+                    "name": function_name,
+                    "content": "Tool doesn't exist",
                 }
+
+            # Build kwargs from function signature
+            kwargs = {}
+            sig = inspect.signature(function)
+
+            # server, user and message should be invisible to Ollama to restrict its tool usage to the context in which it is called
+            for param in sig.parameters.values():
+                if param.name == "server":
+                    kwargs[param.name] = message.guild.id
+                elif param.name == "user":
+                    kwargs[param.name] = args.get("user") or message.author.id
+                elif param.name == "message":
+                    kwargs[param.name] = message
+                elif param.name in args:
+                    kwargs[param.name] = args[param.name]
+                elif param.default is not inspect.Parameter.empty:
+                    kwargs[param.name] = param.default
+
+            # Execute tool
+            try:
+                if inspect.iscoroutinefunction(function):
+                    result = await function(**kwargs)
+                else:
+                    result = function(**kwargs)
+
+                self.logger.debug(
+                    f"Tool executed successfully: {function.__name__} | args={kwargs}"
+                )
+
+                return {
+                    "role": "tool",
+                    "name": function_name,
+                    "content": str(result),
+                }
+
+            except Exception as e:
+                self.logger.exception(f"Error executing tool {function_name}")
+                return {
+                    "role": "tool",
+                    "name": function_name,
+                    "content": f"Error executing tool: {e}",
+                }
+
+        return await asyncio.gather(*(_run_tool(call) for call in tool_calls))
+
+    @asynccontextmanager
+    async def _acquire_karma_lock(self, lock: asyncio.Lock, timeout: int = 10):
+        try:
+            await asyncio.wait_for(lock.acquire(), timeout=timeout)
+        except asyncio.TimeoutError:
+            raise TimeoutError("Karma lock acquire timed out")
+
+        try:
+            yield
+        finally:
+            lock.release()
+
+    @tool
+    def list_tools(self):
+        """
+        List all available tools
+        :return: Available tools
+        """
+        lines = []
+
+        for tool in self.tool_definitions:
+            func = tool["function"]
+
+            lines.append(
+                f"- {func['name']}: {func.get('description', 'No description')}"
             )
 
-            if current.reference:
-                current = await self.get_message(current.channel, current.reference.message_id)
-
-            else:
-                break
-
-        messages.reverse()
-
-        image_urls = await self.extract_image_urls(payload)
-        images_b64 = set()
-        if image_urls:
-            for url in image_urls:
-                images_b64.add(await self.url_to_base64(url))
-        messages.append(
-            {
-                "role"   : "user",
-                "content": payload.content,
-                "images" : images_b64 if images_b64 else ""
-            }
-        )
-
-        return list(messages)
-
-    async def get_message(self, channel: discord.TextChannel, message_id: int):
-        """
-        Helper function to find a message object, looks for a cached message
-        first, falling back to the discord API if not found.
-        :param channel: Channel to look in
-        :param message_id: Message ID to look for
-        :return: Message object
-        """
-        if message_id in self.message_cache:
-            return self.message_cache[message_id]
-
-        try:
-            message = await channel.fetch_message(message_id)
-            await self.cache_message(message_id, message)
-            return message
-
-        except (discord.NotFound, discord.Forbidden) as e:
-            self.logger.error(f"FAILED TO GET MESSAGE: {e}")
-
-    async def cache_message(self, message_id, message):
-        """
-        Cache a message object
-        :param message_id: message ID to cache
-        :param message: message object to cache
-        :return:
-        """
-        self.message_cache[message_id] = message
-        if len(self.message_cache) > self.cache_size:
-            self.message_cache.popitem(last=False)
-
-    async def url_to_base64(self, url: str) -> str:
-        """
-        Converts an image URL to a base64 encoded string.
-        :param url: Image URL
-        :return: Base64 encoded string
-        """
-        try:
-            async with aiohttp.ClientSession() as session:
-                tries = 0
-
-                while url and tries < 5:
-                    async with session.get(url, timeout=10) as response:
-                        content_type = response.headers.get("Content-Type", "")
-                        if "image" in content_type:
-                            data = await response.read()
-                            return base64.b64encode(data).decode("utf-8")
-
-                        elif "text/html" in content_type:
-                            self.logger.debug(f"HTML found: {url}")
-                            html = await response.content.read()
-                            soup = BeautifulSoup(html, "html.parser")
-
-                            og_image = soup.find("meta", property="og:image")
-                            if og_image and og_image.get("content"):
-                                url = og_image["content"]
-                                tries += 1
-                                continue
-
-                        else:
-                            self.logger.debug(f"NO IMAGE IN URL: {url}")
-                            return None
-
-        except aiohttp.ClientError as e:
-            self.logger.error(f"FAILED TO FETCH URL {url}: {e}")
-            return None
-
-    async def extract_image_urls(self, message: discord.Message):
-        """
-        Extracts image URLs from a message and stores them in a set.
-        :param message: Message object to extract image URLs from
-        :return: Image URLs
-        """
-        image_urls = set()
-
-        for attachment in message.attachments:
-            if attachment.content_type == "image":
-                image_urls.add(attachment.url)
-
-        for embed in message.embeds:
-            if embed.thumbnail.url:
-                image_urls.add(embed.thumbnail.url)
-            if embed.image.url:
-                image_urls.add(embed.image.url)
-
-        urls = regex.findall(r"https?://[^\s]+", message.content, flags=regex.IGNORECASE)
-        for url in urls:
-            if url.lower().endswith((".jpg", ".jpeg", ".png", ".gif")):
-                image_urls.add(url)
-
-            else:
-                try:
-                    async with aiohttp.ClientSession() as session:
-                        async with session.get(url, timeout=10) as response:
-                            content_type = response.headers.get("Content-Type", "")
-                            if "text/html" in content_type:
-                                html = await response.text()
-                                soup = BeautifulSoup(html, "html.parser")
-
-                                # og:image
-                                og_image = soup.find("meta", property="og:image")
-                                if og_image and og_image.get("content"):
-                                    image_urls.add(og_image["content"])
-
-                                elif (img := soup.find("img")) and img.get("src"):
-                                    image_urls.add(img["src"])
-
-                except aiohttp.ClientError as e:
-                    self.logger.debug(f"Failed to fetch HTML page {url}: {e}")
-
-        if not image_urls:
-            self.logger.debug(f"NO IMAGE URLS FOUND")
-            return None
-
-        return image_urls
+        return "\n".join(lines)
 
     @tool
-    def respond_to_user(self, response=None) -> str:
+    async def get_server_karma(self, server: int):
         """
-        Call this function if you have called the same tool multiple times
-        or you have already called all the tools you need.
-        :param response: Response to the user's message
-        :return:
+        Get the karma values for all members in the current server
+        :return: A list of the stats for all members in the server
         """
-        return response if response else "RESPONSE TO USER NOT FOUND, TRY AGAIN"
+        try:
+            async with self._acquire_karma_lock(karma_lock):
+                guild = self.bot.get_guild(server)
+                if not guild:
+                    return "Server not found"
 
-    # @tool
-    # async def describe_image(self, image_url: str = None) -> str:
-    #     """
-    #     Describe an image from its image url, accepts images in the format .png, .jpg, .jpeg, .gif, etc.
-    #     It can also scrape a url's html response for images.
-    #     :param image_url: http/https image url
-    #     :return: Description of
-    #     """
-    #     imageb64 = await self.url_to_base64(image_url)
-    #
-    #     if not image_url:
-    #         return "No valid image found"
-    #
-    #     try:
-    #         response = self.client.chat(
-    #             model=self.vision_model,
-    #             messages=[{
-    #                 "role": "user",
-    #                 "content": "Please describe this image.",
-    #                 "images": [imageb64]
-    #             }]
-    #         )
-    #     except Exception as e:
-    #         self.logger.debug(f"FAILED TO GET IMAGE: {e}")
-    #         return "No valid image found"
-    #
-    #     return response.message.content
+                guild_data = karmic_dict.get(server)
+                if not guild_data:
+                    return "No karmic data found"
 
-    @tool
-    def get_server_karma(self, server):
-        """
-        Get the statistics for all users within the server, containing:
-            - Messages
-            - Karma
-            - Karmic Emoji Counts
-        :return: A JSON formatted list of the stats for all members in the server
-        """
-        if karmic_dict:
-            return karmic_dict[server.id]
+                result = {}
 
-        return "No data found"
+                for user_id, stats in guild_data.items():
+                    member = guild.get_member(user_id)
+                    if member:
+                        name = member.display_name
+
+                    result[name] = stats.get("Karma", 0)
+
+                return result
+
+        except TimeoutError:
+            return "Karmic data is currently being updated, please try again later."
 
     @tool
     async def get_gif(self, query: str = None):
@@ -433,7 +360,7 @@ class AITools:
         Returns the reddiquette that users must follow on the server
         :return: Reddiquette
         """
-        return str(REDDIQUETTE)
+        return cleandoc(REDDIQUETTE)
 
     @tool
     def get_server_name(self, server):
@@ -442,7 +369,19 @@ class AITools:
         :return: Server name
         """
         guild = self.bot.get_guild(server)
+        if not guild:
+            return "Server not found"
         return guild.name
+
+    @tool
+    def get_channel_name(self, message):
+        """
+        Get the name of the channel that the chat is taking place in
+        :return: Channel name
+        """
+        if message.channel:
+            return message.channel.name
+        return "No channel found"
 
     @tool
     def get_datetime(self):
@@ -452,8 +391,6 @@ class AITools:
         """
         return str(datetime.now(ZoneInfo("Europe/London")))
 
-    # noinspection PyIncorrectDocstring
-    # Docstring passed through in tool list, AI isn't intended to know about the "server" variable
     @tool
     def get_server_members(self, server, online=False):
         """
@@ -462,11 +399,17 @@ class AITools:
         :return:
         """
         guild = self.bot.get_guild(server)
-        if online:
-            return [member.name for member in guild.members
-                    if member.status != discord.Status.offline]
+        if not guild:
+            return "Server not found"
 
-        return guild.members
+        if online:
+            return [
+                member.name
+                for member in guild.members
+                if member.status != discord.Status.offline
+            ]
+
+        return [member.name for member in guild.members]
 
     @tool
     async def google_search(self, query: str = None):
@@ -478,21 +421,25 @@ class AITools:
         if not query:
             return "No search query found"
 
-        params = {
-            "q"         : query,
-            "format"    : "json",
-            "categories": "general",
-            "count"     : 5
+        params = {"q": query, "format": "json", "categories": "general", "count": 5}
+        headers = {
+            "User-Agent": "Mozilla/5.0",
+            "Accept": "application/json",
         }
 
         results = []
         async with aiohttp.ClientSession() as session:
             try:
-                async with session.get(self.search_url, params=params, timeout=10) as response:
+                async with session.get(
+                    self.search_url,
+                    params=params,
+                    headers=headers,
+                    timeout=aiohttp.ClientTimeout(total=15),
+                ) as response:
                     if response.status != 200:
                         return f"Search failed with status {response.status}"
                     data = await response.json()
-            except aiohttp.ClientError as e:
+            except (aiohttp.ClientError, asyncio.TimeoutError) as e:
                 self.logger.error(f"SEARCH FAILED: {e}")
                 return "Failed to get search results."
 
@@ -514,7 +461,142 @@ class AITools:
         :return: List of custom discord emojis for the current server
         """
         guild = self.bot.get_guild(server)
+        if not guild:
+            return "Server not found"
+
         if emojis := [str(emoji) for emoji in guild.emojis]:
             return " ".join(emojis)
         else:
             return "No emojis found"
+
+    @tool
+    async def create_poll(
+        self,
+        message,
+        question: str,
+        options: list[str],
+        duration: int = 1,
+        multiple: bool = False,
+    ):
+        """
+        Create a fully working poll in the current channel
+        :param question: Required - The question the poll should ask
+        :param duration: How long the poll should last in hours (1 = 1 hour) (max 768 hours) Default: 1 hour
+        :param multiple: True if the poll should allow multiple answers, false otherwise - Default: False
+        :param options: Required - A list of options for the poll - at least 2 required
+        :return:
+        """
+        for arg in [question, options, duration]:
+            if not arg:
+                return "Please provide a valid question, options, and duration value"
+
+        duration = round(int(duration))
+        duration = max(1, min(duration, 768))
+        duration = timedelta(hours=duration)
+
+        if isinstance(options, str):
+            try:
+                options = json.loads(options)
+            except json.JSONDecodeError:
+                return "Options must be a list of strings."
+
+        try:
+            poll = discord.Poll(question=question, duration=duration, multiple=multiple)
+            for option in options:
+                poll.add_answer(text=option)
+
+            await message.reply(poll=poll)
+            return "Poll created successfully"
+
+        except Exception as e:
+            self.logger.error(f"Failed to create poll: {e}")
+            return "Failed to create poll"
+
+    @tool
+    async def create_petition(self, message, text: str):
+        """
+        Create a fully working petition in the current channel
+        :param text: Required - Title of the petition
+        :return:
+        """
+        if not text:
+            return "Please provide a title for the petition"
+
+        try:
+            cog = self.bot.get_cog("Petition")
+            await cog.create_petition(message, text)
+            return "Petition created successfully"
+
+        except Exception as e:
+            self.logger.error(f"Failed to create petition: {e}")
+            return "Failed to create petition"
+
+    # User Memory
+    @tool
+    async def set_user_memory(self, message, key: str, value):
+        """
+        Persist a user memory so it can be retrieved after the bot restarts.
+        :param key: Key to store the value under
+        :param value: Value to store - can be either a string or integer
+        :return:
+        """
+        try:
+            async with self._acquire_karma_lock(ai_memory_lock):
+                guild_id = str(message.guild.id)
+                user_id = str(message.author.id)
+                guild_memories = ai_memories.setdefault(guild_id, {})
+                user_memories = guild_memories.setdefault(user_id, {})
+
+                had_previous_value = key in user_memories
+                previous_value = user_memories.get(key)
+                user_memories[key] = value
+
+                try:
+                    await asyncio.to_thread(utils.save_ai_memories, ai_memories)
+                except (OSError, TypeError, ValueError):
+                    if had_previous_value:
+                        user_memories[key] = previous_value
+                    else:
+                        user_memories.pop(key, None)
+                        if not user_memories:
+                            guild_memories.pop(user_id, None)
+                        if not guild_memories:
+                            ai_memories.pop(guild_id, None)
+
+                    self.logger.exception(
+                        "Failed to persist user memory for key: %s", key
+                    )
+                    return "User memory could not be saved. Please try again later."
+
+                self.logger.info(f"User memory set for key: {key} | Value: {value}")
+                return "User memory set successfully"
+        except TimeoutError:
+            return "User memory could not be set. Please try again later."
+
+    @tool
+    async def get_user_memory(self, message, key: str | None = None):
+        """
+        Retrieve a user memory by key. If no key is provided, returns all user memories for the user.
+        :param key: Key to retrieve the value for, or None to retrieve all values
+        :return: The value associated with the key, or a dictionary of all values if no key is provided
+        """
+        try:
+            async with self._acquire_karma_lock(ai_memory_lock):
+                user_memory = ai_memories.get(str(message.guild.id), {}).get(
+                    str(message.author.id), {}
+                )
+
+                if not user_memory:
+                    return "No user memory found"
+
+                if key:
+                    if key in user_memory:
+                        self.logger.info(f"User memory retrieved for key: {key}")
+                        return f"{user_memory[key]}"
+                    else:
+                        return "Key not found"
+
+                self.logger.info(f"User memory retrieved: {user_memory}")
+                return f"{user_memory}"
+        except TimeoutError:
+            return "User memory could not be retrieved. Please try again later."

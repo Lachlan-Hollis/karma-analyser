@@ -166,4 +166,6 @@ cython_debug/
 
 settings.json
 /karma.json
+/data/
 /cookies.txt
+/.idea/

@@ -1,5 +1,9 @@
 FROM python:3.12-slim
 
+LABEL org.opencontainers.image.title="Karma-Analyser" \
+      org.opencontainers.image.description="Karma-Analyser Discord Bot built with discord.py" \
+      org.opencontainers.image.source="https://github.com/Lachlan-Hollis/karma-analyser"
+
 ENV DEBIAN_FRONTEND=noninteractive
 WORKDIR /app
 
@@ -10,6 +14,7 @@ COPY deductions.json .
 COPY petition.gif .
 COPY tools.py .
 COPY utils.py .
+COPY askbot.py .
 COPY cogs/ ./cogs/
 
 # Install Deno runtime
@@ -33,4 +38,7 @@ RUN apt update && \
 
 RUN pip install --no-cache-dir -r requirements.txt
 
-CMD ["python", "bot.py"]
+HEALTHCHECK --interval=30s --timeout=30s --start-period=5s --retries=3 \
+  CMD curl -f http://localhost:8080/health || exit 1
+
+CMD ["python", "bot.py", "--health-check"]
