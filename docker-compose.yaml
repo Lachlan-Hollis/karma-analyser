@@ -8,5 +8,11 @@ services:
       KLIPY_KEY: "${KLIPY_KEY}"
       OLLAMA_ENDPOINT: "${OLLAMA_ENDPOINT}"
       SEARXNG_ENDPOINT: "${SEARXNG_ENDPOINT}"
+      ELEVENLABS_KEY: "${ELEVENLABS_KEY}"
+      AI_MEMORY_DIR: "${AI_MEMORY_DIR:-/app/data}"
     volumes:
       - ./cookies.txt:/app/cookies.txt:ro
+      - ai-memory:${AI_MEMORY_DIR:-/app/data}
+
+volumes:
+  ai-memory:

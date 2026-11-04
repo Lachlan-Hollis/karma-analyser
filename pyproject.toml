@@ -1,0 +1,19 @@
+[tool.pylint.main]
+ignore = ["venv", ".venv", ".idea"]
+
+[tool.pylint.messages_control]
+disable = [
+    "C0114",
+    "C0115",
+    "C0116",
+    "C0301",
+    "W1203"
+]
+
+[tool.ruff]
+exclude = [
+    "venv",
+    ".venv",
+    ".idea",
+    "cogs/_*.py"
+]
