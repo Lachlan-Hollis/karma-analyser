@@ -2,7 +2,6 @@ from discord.ext import commands
 
 
 class Ben(commands.Cog):
-
     def __init__(self, bot):
         self.bot = bot
 
@@ -25,7 +24,7 @@ class Ben(commands.Cog):
             case "hoho":
                 await ctx.reply("https://tenor.com/view/hohho-ho-gif-24966256")
             case _:
-                await ctx.reply("Ben only understands \"Yes\", \"No\", \"Ugh\", or \"Hoho\"")
+                await ctx.reply('Ben only understands "Yes", "No", "Ugh", or "Hoho"')
 
 
 async def setup(bot):
